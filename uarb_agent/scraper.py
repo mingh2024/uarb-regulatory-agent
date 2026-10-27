@@ -1,0 +1,388 @@
+"""Browser automation for the UARB Public Documents Database.
+
+The site is a FileMaker WebDirect app: everything is rendered client-side, the
+"text boxes" are contenteditable divs, and the document links only exist as
+"GO GET IT" buttons that open a download dialog. There is no API or static HTML
+to scrape, so we drive a real (headless) Chromium with Playwright.
+
+Element ids look like ``b0p1o299i3i0r1``: ``p1`` is the layout part, ``o299``
+the layout object, ``i3`` the portal row and ``r1`` the repetition. Object ids
+differ between tabs, so we only rely on the row/prefix structure and otherwise
+find things by their text and position.
+"""
+from __future__ import annotations
+
+import logging
+import re
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Page
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright
+
+from .models import DOC_TYPES, Document, FetchResult, MatterMetadata
+
+log = logging.getLogger(__name__)
+
+UARB_URL = "https://uarb.novascotia.ca/fmi/webd/UARB15"
+MATTER_RE = re.compile(r"^M\d{5}$")
+TAB_RE = re.compile(r"^(%s)\s*-\s*(\d*)$" % "|".join(DOC_TYPES))
+
+# A tall window makes the document list render ~30 rows up front, so we rarely need to scroll.
+VIEWPORT = {"width": 1440, "height": 2400}
+
+
+class ScrapeError(RuntimeError):
+    """The site misbehaved or changed in a way we could not recover from."""
+
+
+class MatterNotFound(ScrapeError):
+    pass
+
+
+SEARCH_RESULT_JS = """() => {
+  if ([...document.querySelectorAll('.v-window')].some(w => /No Records Found/i.test(w.innerText))) return 'not_found';
+  if ([...document.querySelectorAll('button')].some(b => /^Exhibits\\b/.test(b.innerText.trim()))) return 'found';
+  return null;
+}"""
+
+# Reads the matter header by matching each value box to the column label above it.
+METADATA_JS = """() => {
+  const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const box = e => { const r = e.getBoundingClientRect(); return {x: r.left, y: r.top, b: r.bottom}; };
+  const tab = [...document.querySelectorAll('button')].find(b => /^Exhibits\\b/.test(b.innerText.trim()));
+  const tabTop = tab ? tab.getBoundingClientRect().top : Infinity;
+  const columns = {matter: /^Matter No/, title: /^Title/, type: /^Type/, received: /^Date Received/,
+                   final: /^(Date Final|Decision Date)/, outcome: /^Outcome/};
+  const labels = {};
+  for (const el of document.querySelectorAll('.v-label')) {
+    if (!visible(el)) continue;
+    const text = el.innerText.trim();
+    for (const [key, re] of Object.entries(columns)) {
+      if (re.test(text) && !(key in labels)) labels[key] = {el, ...box(el)};
+    }
+  }
+  if (!labels.matter) return null;
+  const top = Math.max(...Object.values(labels).map(l => l.b)) - 2;
+  const valueCols = ['matter', 'type', 'received', 'final', 'outcome'].filter(k => labels[k]);
+  const fields = {};
+  for (const el of document.querySelectorAll('.fm-textarea')) {
+    if (!visible(el)) continue;
+    const r = box(el);
+    if (r.y < top || r.y >= tabTop) continue;
+    const key = valueCols.reduce((best, k) =>
+      Math.abs(labels[k].x - r.x) < Math.abs(labels[best].x - r.x) ? k : best, valueCols[0]);
+    (fields[key] = fields[key] || []).push({y: r.y, text: el.innerText.trim()});
+  }
+  for (const k in fields) fields[k] = fields[k].sort((a, b) => a.y - b.y).map(f => f.text);
+  let title = '';
+  if (labels.title) {
+    const own = new Set(Object.values(labels).map(l => l.el));
+    title = [...document.querySelectorAll('.v-label')]
+      .filter(el => visible(el) && !own.has(el))
+      .filter(el => { const r = box(el); return r.y >= top && r.y < tabTop && Math.abs(r.x - labels.title.x) < 60; })
+      .map(el => el.innerText.trim()).filter(Boolean).join('\\n');
+  }
+  return {fields, title};
+}"""
+
+# One entry per document row that has a GO GET IT button, with the row's field texts in reading order.
+ROWS_JS = """() => {
+  const out = [];
+  for (const btn of document.querySelectorAll('button')) {
+    if (!/GO GET IT/i.test(btn.innerText)) continue;
+    const m = /^(b\\d+p\\d+)o\\d+i(\\d+)i0r\\d+$/.exec(btn.id);
+    if (!m) continue;
+    const [, prefix, row] = m;
+    const sameRow = new RegExp('^' + prefix + 'o\\\\d+i' + row + 'i0r\\\\d+$');
+    const fields = [...document.querySelectorAll('.fm-textarea[id^="' + prefix + 'o"]')]
+      .filter(el => sameRow.test(el.id))
+      .map(el => { const r = el.getBoundingClientRect(); return {text: el.innerText.trim(), x: r.left, y: r.top}; })
+      .filter(f => f.text)
+      .sort((a, b) => (a.y - b.y) || (a.x - b.x));
+    out.push({row: Number(row), buttonId: btn.id, fields: fields.map(f => f.text)});
+  }
+  return out.sort((a, b) => a.row - b.row);
+}"""
+
+
+class UARBScraper:
+    def __init__(
+        self,
+        headless: bool = True,
+        timeout_ms: int = 60_000,
+        download_timeout_ms: int = 60_000,
+        retries: int = 2,
+    ):
+        # download_timeout_ms bounds how long a download takes to *start*; finishing a big file is not timed.
+        self.headless = headless
+        self.timeout_ms = timeout_ms
+        self.download_timeout_ms = download_timeout_ms
+        self.retries = retries
+
+    def fetch(
+        self,
+        matter: str,
+        doc_type: Optional[str],
+        dest_dir: Path,
+        limit: int = 10,
+        max_total_bytes: Optional[int] = None,
+    ) -> FetchResult:
+        """Look up a matter and download up to ``limit`` documents of ``doc_type``.
+
+        With ``doc_type=None`` only the matter metadata and counts are read.
+        Files that would push the total past ``max_total_bytes`` are discarded
+        and reported in ``FetchResult.oversized``.
+        """
+        matter = matter.strip().upper()
+        if not MATTER_RE.match(matter):
+            raise ValueError(f"Matter numbers look like M12205, got {matter!r}")
+        if doc_type is not None and doc_type not in DOC_TYPES:
+            raise ValueError(f"Unknown document type {doc_type!r}")
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.retries + 2):
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
+            dest_dir.mkdir(parents=True)
+            try:
+                return self._fetch_once(matter, doc_type, dest_dir, limit, max_total_bytes)
+            except MatterNotFound:
+                raise
+            except (PlaywrightError, ScrapeError) as e:
+                last_error = e
+                log.warning("Attempt %d to fetch %s failed: %s", attempt, matter, e)
+        raise ScrapeError(f"Could not read {matter} from the UARB site: {last_error}") from last_error
+
+    def _fetch_once(self, matter, doc_type, dest_dir, limit, max_total_bytes) -> FetchResult:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=self.headless)
+            try:
+                context = browser.new_context(viewport=VIEWPORT, accept_downloads=True)
+                page = context.new_page()
+                page.set_default_timeout(self.timeout_ms)
+                self._open_matter(page, matter)
+                metadata = self._read_metadata(page, matter)
+                result = FetchResult(metadata=metadata, doc_type=doc_type)
+                if doc_type and metadata.counts.get(doc_type) != 0:
+                    self._download_documents(page, result, dest_dir, limit, max_total_bytes)
+                return result
+            finally:
+                browser.close()
+
+    # -- search -----------------------------------------------------------
+
+    def _open_matter(self, page: Page, matter: str) -> None:
+        log.info("Opening %s", matter)
+        page.goto(UARB_URL, wait_until="domcontentloaded")
+        page.get_by_text("Go Directly to Matter").wait_for()
+        matter_box = page.locator(".fm-textarea", has=page.locator(".placeholder", has_text="M01234"))
+        box_position = matter_box.bounding_box()
+        matter_box.click()
+        # WebDirect swaps in a contenteditable editor on click; typing before it exists is lost.
+        page.wait_for_function("() => document.activeElement && document.activeElement.isContentEditable")
+        page.keyboard.type(matter, delay=40)
+        # Leaving the field commits the value, and the site runs its search on field exit.
+        page.keyboard.press("Tab")
+        outcome = self._wait_for_search(page, 15_000)
+        if outcome is None:
+            log.info("No search result yet; clicking Search")
+            self._click_search_button_near(page, box_position)
+            outcome = self._wait_for_search(page, self.timeout_ms)
+        if outcome == "not_found":
+            raise MatterNotFound(f"{matter} was not found on the UARB site")
+        if outcome != "found":
+            raise ScrapeError(f"Search for {matter} never returned a result")
+
+    def _wait_for_search(self, page: Page, timeout_ms: int) -> Optional[str]:
+        try:
+            return page.wait_for_function(SEARCH_RESULT_JS, timeout=timeout_ms).json_value()
+        except PlaywrightTimeout:
+            return None
+
+    def _click_search_button_near(self, page: Page, box_position) -> None:
+        """Click the Search button on the same row as the matter box, if it is still on screen.
+
+        If it isn't, the page is most likely already moving to the result, so we just keep waiting.
+        """
+        buttons = page.locator("button", has_text=re.compile(r"^\s*Search\s*$"))
+        best, best_distance = None, float("inf")
+        for i in range(buttons.count()):
+            position = buttons.nth(i).bounding_box()
+            if position and box_position:
+                distance = abs(position["y"] - box_position["y"])
+                if distance < best_distance:
+                    best, best_distance = buttons.nth(i), distance
+        if best is None:
+            log.info("Search button not found; waiting for the result instead")
+            return
+        best.click()
+
+    # -- metadata ---------------------------------------------------------
+
+    def _read_metadata(self, page: Page, matter: str) -> MatterMetadata:
+        counts = self._read_counts(page)
+        data = page.evaluate(METADATA_JS)
+        if not data:
+            raise ScrapeError("Matter page loaded without its header")
+        fields: Dict[str, List[str]] = data["fields"]
+
+        def value(column: str, index: int) -> str:
+            values = fields.get(column, [])
+            return values[index] if len(values) > index else ""
+
+        lines = [line.strip() for line in data["title"].splitlines() if line.strip()]
+        title = lines[0] if lines else ""
+        description = " ".join(lines[1:])
+        if description == title:
+            description = ""
+        return MatterMetadata(
+            matter=matter,
+            title=title,
+            description=description,
+            status=value("matter", 1),
+            type=value("type", 0),
+            category=value("type", 1),
+            date_received=value("received", 0),
+            date_final=value("final", 0),
+            outcome=value("outcome", 0),
+            counts=counts,
+        )
+
+    def _read_counts(self, page: Page) -> Dict[str, Optional[int]]:
+        """Read "Exhibits - 13" style tab labels. The numbers fill in a moment after the page loads."""
+        counts: Dict[str, Optional[int]] = {}
+        for _ in range(30):
+            counts = {doc_type: None for doc_type in DOC_TYPES}
+            for text in page.locator("button").all_inner_texts():
+                match = TAB_RE.match(text.strip())
+                if match and match.group(2):
+                    counts[match.group(1)] = int(match.group(2))
+            if all(c is not None for c in counts.values()):
+                break
+            page.wait_for_timeout(500)
+        return counts
+
+    # -- documents --------------------------------------------------------
+
+    def _download_documents(self, page, result: FetchResult, dest_dir, limit, max_total_bytes) -> None:
+        doc_type = result.doc_type
+        log.info("Opening the %s tab", doc_type)
+        page.locator("button", has_text=re.compile(r"^\s*%s\s*-" % re.escape(doc_type))).first.click()
+        try:
+            page.locator("button", has_text="GO GET IT").first.wait_for()
+        except PlaywrightTimeout:
+            raise ScrapeError(f"The {doc_type} tab did not list any downloadable documents")
+        rows = self._list_rows(page, limit)
+
+        used = 0
+        for seq, row in enumerate(rows[:limit], start=1):
+            doc = _describe_row(row)
+            try:
+                path = self._download_row(page, row["buttonId"], dest_dir / f"{seq:02d}")
+            except (PlaywrightError, ScrapeError) as e:
+                log.warning("Could not download %s: %s", doc.label, e)
+                self._close_dialogs(page)
+                result.failed.append(doc)
+                continue
+            doc.path, doc.filename, doc.size = path, path.name, path.stat().st_size
+            if max_total_bytes is not None and used + doc.size > max_total_bytes:
+                log.info("%s (%d bytes) does not fit in the attachment budget", doc.label, doc.size)
+                path.unlink()
+                doc.path = None
+                result.oversized.append(doc)
+                continue
+            used += doc.size
+            result.documents.append(doc)
+            log.info("Downloaded %s (%d bytes)", doc.filename, doc.size)
+
+    def _list_rows(self, page: Page, wanted: int) -> List[dict]:
+        """Collect rendered rows, scrolling the list if fewer than ``wanted`` are on screen."""
+        rows: Dict[int, dict] = {}
+        for _ in range(5):
+            before = len(rows)
+            for row in page.evaluate(ROWS_JS):
+                rows.setdefault(row["row"], row)
+            if len(rows) >= wanted or (len(rows) == before and before):
+                break
+            last = max(rows.values(), key=lambda r: r["row"], default=None)
+            if last is None:
+                page.wait_for_timeout(1000)
+                continue
+            page.locator(f"#{last['buttonId']}").scroll_into_view_if_needed()
+            page.wait_for_timeout(1000)
+        return [rows[k] for k in sorted(rows)]
+
+    def _download_row(self, page: Page, button_id: str, dest_dir: Path) -> Path:
+        page.locator(f"#{button_id}").click()
+        dialogs = page.locator(".v-window")
+        dialogs.filter(has_text=re.compile("Download Files|Export Field to File")).first.wait_for()
+        # Transcripts and recordings first ask for a filename (pre-filled, e.g.
+        # "NSUARB-M10431-September 12, 2022.pdf"). Chrome refuses downloads whose
+        # Content-Disposition filename has a comma (ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_DISPOSITION),
+        # so strip commas and semicolons before accepting.
+        export = dialogs.filter(has_text="Export Field to File")
+        if export.count():
+            name_box = export.locator("input")
+            name = name_box.input_value()
+            clean = re.sub(r"\s*[,;]\s*", " ", name).strip()
+            if clean and clean != name:
+                name_box.fill(clean)
+            export.locator(".v-button", has_text=re.compile(r"^\s*OK\s*$")).click()
+        download_dialog = dialogs.filter(has_text="Download Files")
+        download_dialog.wait_for()
+        buttons = download_dialog.locator(".fm-download-button")
+        if buttons.count() == 0:
+            raise ScrapeError("Download dialog had no files")
+        # One GO GET IT normally yields one file; keep only the first if the site ever offers more.
+        with page.expect_download(timeout=self.download_timeout_ms) as info:
+            buttons.first.click()
+        download = info.value
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path = dest_dir / _safe_filename(download.suggested_filename)
+        download.save_as(path)
+        self._close_dialogs(page)
+        return path
+
+    def _close_dialogs(self, page: Page) -> None:
+        for _ in range(3):
+            dialogs = page.locator(".v-window")
+            if dialogs.count() == 0:
+                return
+            button = dialogs.first.locator(".v-button", has_text=re.compile(r"^\s*(Close|Cancel|OK)\s*$"))
+            try:
+                if button.count():
+                    button.first.click()
+                else:
+                    page.keyboard.press("Escape")
+                dialogs.first.wait_for(state="detached", timeout=5_000)
+            except PlaywrightError:
+                pass
+
+
+def _describe_row(row: dict) -> Document:
+    """Turn a row's field texts into a Document.
+
+    Exhibits / Key / Other Documents rows hold: doc number, title, extension, date, security.
+    Transcripts / Recordings rows hold: date, title parts, (format), security.
+    """
+    doc_no = date = ""
+    title_parts: List[str] = []
+    for text in row["fields"]:
+        if not doc_no and re.fullmatch(r"\d{3,}", text):
+            doc_no = text
+        elif not date and re.fullmatch(r"\d{2}/\d{2}/\d{4}", text):
+            date = text
+        elif re.fullmatch(r"\.\w{1,5}", text) or text.lower() in ("pdf", "public", "confidential"):
+            continue
+        elif text not in title_parts:
+            title_parts.append(text)
+    return Document(row=row["row"], doc_id=doc_no or date, title=" - ".join(title_parts), date=date)
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name).strip(" .")
+    return name or "document"
