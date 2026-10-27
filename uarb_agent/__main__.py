@@ -3,6 +3,8 @@
     python -m uarb_agent run            # watch the inbox and answer requests
     python -m uarb_agent run --once     # answer what is waiting, then exit
     python -m uarb_agent ask "Hi Agent, can you give me Other Documents files from M12205?"
+
+Add --demo to either command to watch the browser work (for recording a demo).
 """
 from __future__ import annotations
 
@@ -60,10 +62,11 @@ def cmd_run(args, config: Config) -> int:
     agent = RegulatoryAgent(config)
     mailbox = Mailbox(config)
     log.info(
-        "Watching %s every %ds (Claude request parsing %s)",
+        "Watching %s every %ds (Claude request parsing %s%s)",
         config.imap_user,
         config.poll_interval,
         f"on, model {config.claude_model}" if config.use_llm else "off",
+        "; demo mode" if config.demo else "",
     )
     while True:
         try:
@@ -96,13 +99,16 @@ def main(argv=None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    demo_help = "show the browser full-screen and slow it down, for recording a demo"
     run = sub.add_parser("run", help="watch the inbox and answer requests")
     run.add_argument("--once", action="store_true", help="process unread mail once and exit")
+    run.add_argument("--demo", action="store_true", help=demo_help)
 
     ask = sub.add_parser("ask", help="answer a request typed here instead of emailed")
     ask.add_argument("text", help="the request, e.g. 'Other Documents for M12205'")
     ask.add_argument("--subject", default="", help="optional email subject")
     ask.add_argument("--name", default="User", help="name to greet in the reply")
+    ask.add_argument("--demo", action="store_true", help=demo_help)
 
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -111,6 +117,7 @@ def main(argv=None) -> int:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     config = Config.from_env()
+    config.demo = config.demo or args.demo
     if args.command == "run":
         return cmd_run(args, config)
     return cmd_ask(args, config)

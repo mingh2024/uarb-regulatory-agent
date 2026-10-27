@@ -57,6 +57,14 @@ def test_not_found_and_site_errors(tmp_path):
     assert "Something went wrong" in reply.body
 
 
+def test_demo_mode_shows_the_browser(monkeypatch):
+    monkeypatch.setenv("DEMO_MODE", "true")
+    config = Config.from_env(env_file=None)
+    scraper = RegulatoryAgent(config).scraper
+    assert (scraper.demo, scraper.headless) == (True, False)
+    assert RegulatoryAgent(Config()).scraper.headless is True
+
+
 def test_describe_row_handles_both_layouts():
     exhibit = _describe_row({"row": 1, "fields": ["102674", "Board Order", ".pdf", "07/08/2026", "Public"]})
     assert (exhibit.doc_id, exhibit.title, exhibit.date) == ("102674", "Board Order", "07/08/2026")

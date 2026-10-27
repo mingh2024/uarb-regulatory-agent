@@ -46,6 +46,7 @@ class Config:
     max_documents: int = 10
     max_attachment_bytes: int = 18 * 1024 * 1024
     headless: bool = True
+    demo: bool = False  # visible, screen-sized, slowed-down browser for recordings
     output_dir: Path = Path("output")
 
     @classmethod
@@ -75,6 +76,7 @@ class Config:
             max_documents=_int("MAX_DOCUMENTS", 10),
             max_attachment_bytes=int(float(os.getenv("MAX_ATTACHMENT_MB", "18")) * 1024 * 1024),
             headless=_bool("HEADLESS", True),
+            demo=_bool("DEMO_MODE", False),
             output_dir=Path(os.getenv("OUTPUT_DIR", "output")),
         )
 

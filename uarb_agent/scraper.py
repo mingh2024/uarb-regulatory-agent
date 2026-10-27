@@ -16,7 +16,7 @@ import logging
 import re
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
@@ -33,6 +33,9 @@ TAB_RE = re.compile(r"^(%s)\s*-\s*(\d*)$" % "|".join(DOC_TYPES))
 
 # A tall window makes the document list render ~30 rows up front, so we rarely need to scroll.
 VIEWPORT = {"width": 1440, "height": 2400}
+# Demo mode: delay before each browser action, and how long to hold key screens.
+DEMO_SLOW_MO_MS = 250
+DEMO_PAUSE_MS = 1500
 
 
 class ScrapeError(RuntimeError):
@@ -90,6 +93,8 @@ METADATA_JS = """() => {
 }"""
 
 # One entry per document row that has a GO GET IT button, with the row's field texts in reading order.
+# "visible" is whether the button sits inside the list's visible area (the grid also renders a few
+# rows above and below it).
 ROWS_JS = """() => {
   const out = [];
   for (const btn of document.querySelectorAll('button')) {
@@ -103,9 +108,23 @@ ROWS_JS = """() => {
       .map(el => { const r = el.getBoundingClientRect(); return {text: el.innerText.trim(), x: r.left, y: r.top}; })
       .filter(f => f.text)
       .sort((a, b) => (a.y - b.y) || (a.x - b.x));
-    out.push({row: Number(row), buttonId: btn.id, fields: fields.map(f => f.text)});
+    const area = btn.closest('.v-grid') && btn.closest('.v-grid').querySelector('.v-grid-tablewrapper');
+    const b = btn.getBoundingClientRect();
+    const a = area ? area.getBoundingClientRect() : {top: -Infinity, bottom: Infinity};
+    const visible = b.height > 0 && b.top >= a.top - 1 && b.bottom <= a.bottom + 1;
+    out.push({row: Number(row), buttonId: btn.id, visible, fields: fields.map(f => f.text)});
   }
   return out.sort((a, b) => a.row - b.row);
+}"""
+
+# The document list is a Vaadin grid with its own scrollbar element; moving it renders the next rows.
+# Half a screen per step, so every row passes through the visible area.
+SCROLL_GRID_JS = """() => {
+  const scroller = document.querySelector('.v-grid-scroller-vertical');
+  if (!scroller) return false;
+  const before = scroller.scrollTop;
+  scroller.scrollTop = before + Math.max(60, scroller.clientHeight / 2);
+  return scroller.scrollTop > before;
 }"""
 
 
@@ -116,9 +135,12 @@ class UARBScraper:
         timeout_ms: int = 60_000,
         download_timeout_ms: int = 60_000,
         retries: int = 2,
+        demo: bool = False,
     ):
         # download_timeout_ms bounds how long a download takes to *start*; finishing a big file is not timed.
-        self.headless = headless
+        # demo shows the browser filling the screen and slows it down enough to follow on a recording.
+        self.demo = demo
+        self.headless = headless and not demo
         self.timeout_ms = timeout_ms
         self.download_timeout_ms = download_timeout_ms
         self.retries = retries
@@ -159,12 +181,21 @@ class UARBScraper:
 
     def _fetch_once(self, matter, doc_type, dest_dir, limit, max_total_bytes) -> FetchResult:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
+            browser = p.chromium.launch(headless=self.headless, slow_mo=DEMO_SLOW_MO_MS if self.demo else 0)
             try:
-                context = browser.new_context(viewport=VIEWPORT, accept_downloads=True)
-                page = context.new_page()
+                # WebDirect translates its own dialogs ("Download Files", "No Records Found", ...) into
+                # the browser's language, and we find them by their English text, so pin English.
+                if self.demo:
+                    # No fixed viewport: the page takes the size of the window, which we fit to the screen.
+                    context = browser.new_context(no_viewport=True, accept_downloads=True, locale="en-US")
+                    page = context.new_page()
+                    _fit_window_to_screen(page)
+                else:
+                    context = browser.new_context(viewport=VIEWPORT, accept_downloads=True, locale="en-US")
+                    page = context.new_page()
                 page.set_default_timeout(self.timeout_ms)
                 self._open_matter(page, matter)
+                self._pause(page)
                 metadata = self._read_metadata(page, matter)
                 result = FetchResult(metadata=metadata, doc_type=doc_type)
                 if doc_type and metadata.counts.get(doc_type) != 0:
@@ -172,6 +203,11 @@ class UARBScraper:
                 return result
             finally:
                 browser.close()
+
+    def _pause(self, page: Page) -> None:
+        """Hold the current screen for a moment in demo mode so viewers can read it."""
+        if self.demo:
+            page.wait_for_timeout(DEMO_PAUSE_MS)
 
     # -- search -----------------------------------------------------------
 
@@ -276,45 +312,65 @@ class UARBScraper:
             page.locator("button", has_text="GO GET IT").first.wait_for()
         except PlaywrightTimeout:
             raise ScrapeError(f"The {doc_type} tab did not list any downloadable documents")
-        rows = self._list_rows(page, limit)
+        self._pause(page)
 
+        # The list is a virtual grid that only keeps a few rows in the page and drops them as it
+        # scrolls, so download what is rendered (in order), then scroll for the next batch.
+        seen: Set[int] = set()
         used = 0
-        for seq, row in enumerate(rows[:limit], start=1):
-            doc = _describe_row(row)
-            try:
-                path = self._download_row(page, row["buttonId"], dest_dir / f"{seq:02d}")
-            except (PlaywrightError, ScrapeError) as e:
-                log.warning("Could not download %s: %s", doc.label, e)
-                self._close_dialogs(page)
-                result.failed.append(doc)
-                continue
-            doc.path, doc.filename, doc.size = path, path.name, path.stat().st_size
-            if max_total_bytes is not None and used + doc.size > max_total_bytes:
-                log.info("%s (%d bytes) does not fit in the attachment budget", doc.label, doc.size)
-                path.unlink()
-                doc.path = None
-                result.oversized.append(doc)
-                continue
-            used += doc.size
-            result.documents.append(doc)
-            log.info("Downloaded %s (%d bytes)", doc.filename, doc.size)
-
-    def _list_rows(self, page: Page, wanted: int) -> List[dict]:
-        """Collect rendered rows, scrolling the list if fewer than ``wanted`` are on screen."""
-        rows: Dict[int, dict] = {}
-        for _ in range(5):
-            before = len(rows)
-            for row in page.evaluate(ROWS_JS):
-                rows.setdefault(row["row"], row)
-            if len(rows) >= wanted or (len(rows) == before and before):
+        while len(seen) < limit:
+            rows = self._unseen_rows(page, seen)
+            if not rows:
                 break
-            last = max(rows.values(), key=lambda r: r["row"], default=None)
-            if last is None:
-                page.wait_for_timeout(1000)
-                continue
-            page.locator(f"#{last['buttonId']}").scroll_into_view_if_needed()
-            page.wait_for_timeout(1000)
-        return [rows[k] for k in sorted(rows)]
+            for row in rows:
+                if len(seen) >= limit:
+                    break
+                seen.add(row["row"])
+                doc = _describe_row(row)
+                path = self._download_row_with_retry(page, row["buttonId"], dest_dir / f"{len(seen):02d}", doc)
+                if path is None:
+                    result.failed.append(doc)
+                    continue
+                doc.path, doc.filename, doc.size = path, path.name, path.stat().st_size
+                if max_total_bytes is not None and used + doc.size > max_total_bytes:
+                    log.info("%s (%d bytes) does not fit in the attachment budget", doc.label, doc.size)
+                    path.unlink()
+                    doc.path = None
+                    result.oversized.append(doc)
+                    continue
+                used += doc.size
+                result.documents.append(doc)
+                log.info("Downloaded %s (%d bytes)", doc.filename, doc.size)
+
+    def _unseen_rows(self, page: Page, seen: Set[int]) -> List[dict]:
+        """Visible rows not handled yet, scrolling the grid down to reveal more when needed."""
+
+        def visible_unseen() -> List[dict]:
+            return [row for row in page.evaluate(ROWS_JS) if row["visible"] and row["row"] not in seen]
+
+        rows = visible_unseen()
+        for _ in range(15):
+            if rows:
+                return rows
+            if not page.evaluate(SCROLL_GRID_JS):
+                return []  # already at the bottom
+            # The grid fetches the newly revealed rows from the server; give it a moment.
+            for _ in range(10):
+                page.wait_for_timeout(500)
+                rows = visible_unseen()
+                if rows:
+                    break
+        return rows
+
+    def _download_row_with_retry(self, page: Page, button_id: str, dest_dir: Path, doc: Document) -> Optional[Path]:
+        """Download one row, trying a second time if the site drops it. Returns None if both fail."""
+        for attempt in (1, 2):
+            try:
+                return self._download_row(page, button_id, dest_dir)
+            except (PlaywrightError, ScrapeError) as e:
+                log.warning("Could not download %s (attempt %d): %s", doc.label, attempt, e)
+                self._close_dialogs(page)
+        return None
 
     def _download_row(self, page: Page, button_id: str, dest_dir: Path) -> Path:
         page.locator(f"#{button_id}").click()
@@ -335,7 +391,10 @@ class UARBScraper:
         download_dialog = dialogs.filter(has_text="Download Files")
         download_dialog.wait_for()
         buttons = download_dialog.locator(".fm-download-button")
-        if buttons.count() == 0:
+        try:
+            # On a slow server the dialog appears a moment before its file button.
+            buttons.first.wait_for(timeout=15_000)
+        except PlaywrightTimeout:
             raise ScrapeError("Download dialog had no files")
         # One GO GET IT normally yields one file; keep only the first if the site ever offers more.
         with page.expect_download(timeout=self.download_timeout_ms) as info:
@@ -381,6 +440,20 @@ def _describe_row(row: dict) -> Document:
         elif text not in title_parts:
             title_parts.append(text)
     return Document(row=row["row"], doc_id=doc_no or date, title=" - ".join(title_parts), date=date)
+
+
+def _fit_window_to_screen(page: Page) -> None:
+    """Resize the visible browser window to the screen's usable area (demo mode, Chromium only)."""
+    try:
+        cdp = page.context.new_cdp_session(page)
+        window_id = cdp.send("Browser.getWindowForTarget")["windowId"]
+        bounds = page.evaluate(
+            "() => ({left: screen.availLeft, top: screen.availTop, width: screen.availWidth, height: screen.availHeight})"
+        )
+        cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": bounds})
+        log.info("Demo window sized to %dx%d", bounds["width"], bounds["height"])
+    except PlaywrightError as e:
+        log.warning("Could not resize the demo window: %s", e)
 
 
 def _safe_filename(name: str) -> str:

@@ -54,6 +54,15 @@ python -m uarb_agent run          # keep watching
 python -m uarb_agent run --once   # answer what's waiting, then exit
 ```
 
+**Demo mode (for recording).** Add `--demo` to either command, or set `DEMO_MODE=true`. The browser
+then opens in a visible window sized to the screen. Each action is slowed by 250 ms, and the matter
+page and the document list are held on screen for 1.5 s, so a viewer can follow along:
+
+```bash
+python -m uarb_agent ask --demo "Hi Agent, Can you give me Other Documents files from M12205? Thanks!"
+python -m uarb_agent run --demo
+```
+
 ### Mailbox setup (Gmail)
 
 1. Create a Gmail account for the agent and turn on 2-Step Verification.
@@ -109,12 +118,18 @@ Things I found while exploring the site that shaped the scraper:
   the element id (`…i3i0r1` = row 3), which is the same on every layout.
 - **"GO GET IT" doesn't download directly.** It opens a "Download Files" dialog with a button per file.
   Transcripts and recordings add an "Export Field to File" dialog first, with a pre-filled filename.
+- **System dialogs follow the browser's language.** On a Chinese-language Mac, a visible Chromium got
+  "下载文件 … 关闭" instead of "Download Files … Close", and the scraper couldn't find them. The browser
+  is pinned to `en-US`, so it behaves the same on any machine.
 - **Commas break transcript downloads in Chrome.** Transcript names look like
   `NSUARB-M10431-September 12, 2022.pdf`. The server puts that name unquoted in `Content-Disposition`,
   and Chrome rejects the response (`ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_DISPOSITION`), so clicking
   does nothing. The scraper removes commas from the Save As box before clicking OK.
-- **The list is virtualized.** The browser window is 2400px tall so about 30 rows render. The scraper
-  scrolls if it needs more.
+- **The list is a virtual grid.** It keeps only the rows near the visible area in the page, drops
+  them as you scroll, and moves with its own scrollbar element rather than page scrolling. The
+  headless window is 2400px tall so about 30 rows fit at once. In shorter windows (like demo mode),
+  the scraper downloads the rows that are fully visible, then scrolls the grid half a screen at a time,
+  so no row is skipped.
 - The site is occasionally slow, so a failed attempt retries in a fresh browser session (2 retries).
 
 One data quirk: some rows share the same PDF under two document numbers. For example, 102329 and
@@ -177,6 +192,7 @@ All settings come from environment variables or `.env`. See [.env.example](.env.
 | `MAX_DOCUMENTS` | `10` | Documents per request. |
 | `MAX_ATTACHMENT_MB` | `18` | Total file size to attach. Gmail's 25 MB limit applies after base64 encoding. |
 | `HEADLESS` | `true` | Set `false` to watch the browser. |
+| `DEMO_MODE` | `false` | Visible screen-sized browser, slowed down for recording (same as `--demo`). |
 
 ## Tests
 
@@ -184,7 +200,7 @@ All settings come from environment variables or `.env`. See [.env.example](.env.
 python -m pytest
 ```
 
-The 37 unit tests cover request parsing (rules, Claude result handling and fallbacks), reply wording
+The 38 unit tests cover request parsing (rules, Claude result handling and fallbacks), reply wording
 (including the assignment's example word for word), ZIP naming, the email headers, loop guards, and
 the agent's decisions. A fake scraper and a fake Claude client keep them offline and fast.
 
@@ -194,7 +210,8 @@ These were also checked against the live site (October 27, 2026):
 | --- | --- |
 | M12205 Other Documents | 10 of 43 attached, metadata matches the site, about 16 s |
 | M12383 Key Documents | "all 4 Key Documents" attached |
-| M10431 Transcripts | date-first layout, export dialog, comma filenames: 3 of 3 attached |
+| M10431 Transcripts | date-first layout, export dialog, comma filenames: all 10 attached, about 28 s |
+| M12205 Other Documents, `--demo` | visible 1470×860 window, grid scrolled past row 8, 10 of 43 attached, about 24 s |
 | M10431 Recordings | 326 MB and 34 MB MP3s, both reported as too large to email |
 | M12205 Transcripts | zero documents, nothing attached |
 | "What is in matter 12383?" | summary and counts, asks which type |

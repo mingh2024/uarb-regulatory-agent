@@ -33,7 +33,7 @@ class AgentReply:
 class RegulatoryAgent:
     def __init__(self, config: Config, scraper: Optional[UARBScraper] = None, parser: Optional[RequestParser] = None):
         self.config = config
-        self.scraper = scraper or UARBScraper(headless=config.headless)
+        self.scraper = scraper or UARBScraper(headless=config.headless, demo=config.demo)
         self.parser = parser or RequestParser(use_llm=config.use_llm, model=config.claude_model)
 
     def handle(self, subject: str, body: str, sender_name: str, workdir: Path) -> AgentReply:
