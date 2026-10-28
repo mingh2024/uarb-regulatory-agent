@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # The five document tabs on a matter page, in the order the site shows them.
 DOC_TYPES = ("Exhibits", "Key Documents", "Other Documents", "Transcripts", "Recordings")
@@ -17,6 +17,15 @@ SINGULAR = {
 }
 
 
+def reference_line(matter: Optional[str], doc_type: Optional[str]) -> str:
+    """The "Request: M12205 · Other Documents" footer on every reply.
+
+    When the user answers, their mail client quotes it back, which is how the agent
+    remembers what the thread is about (see request_parser.from_thread).
+    """
+    return f"Request: {matter or 'no matter number yet'} · {doc_type or 'no document type yet'}"
+
+
 @dataclass
 class DocumentRequest:
     """What the user asked for. Either field may be missing if the email was unclear."""
@@ -24,6 +33,7 @@ class DocumentRequest:
     matter: Optional[str]
     doc_type: Optional[str]
     parsed_by: str = "rules"  # "llm" or "rules"
+    from_thread: Tuple[str, ...] = ()  # fields recovered from earlier emails in the thread
 
 
 @dataclass
@@ -52,6 +62,7 @@ class Document:
     path: Optional[Path] = None  # local file once downloaded
     filename: str = ""  # the name the site gave the download
     size: int = 0
+    sha256: str = ""
 
     @property
     def label(self) -> str:

@@ -12,6 +12,7 @@ find things by their text and position.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import shutil
@@ -332,6 +333,7 @@ class UARBScraper:
                     result.failed.append(doc)
                     continue
                 doc.path, doc.filename, doc.size = path, path.name, path.stat().st_size
+                doc.sha256 = _sha256(path)
                 if max_total_bytes is not None and used + doc.size > max_total_bytes:
                     log.info("%s (%d bytes) does not fit in the attachment budget", doc.label, doc.size)
                     path.unlink()
@@ -422,15 +424,25 @@ class UARBScraper:
                 pass
 
 
+EXHIBIT_NO_RE = re.compile(r"[A-Z]{1,4}-\d+(?:\.\d+)?")
+
+
 def _describe_row(row: dict) -> Document:
     """Turn a row's field texts into a Document.
 
-    Exhibits / Key / Other Documents rows hold: doc number, title, extension, date, security.
+    Key / Other Documents rows hold: doc number, title, extension, date, security.
+    Exhibits rows hold: title, extension, date, exhibit number (A-1, H-12), security.
     Transcripts / Recordings rows hold: date, title parts, (format), security.
     """
+    fields = row["fields"]
+    # The exhibit number comes after the title, so take the last match ("RIR-1" can be a title).
+    exhibit_nos = [i for i, text in enumerate(fields) if EXHIBIT_NO_RE.fullmatch(text)]
+    exhibit_at = exhibit_nos[-1] if exhibit_nos else -1
     doc_no = date = ""
     title_parts: List[str] = []
-    for text in row["fields"]:
+    for i, text in enumerate(fields):
+        if i == exhibit_at:
+            continue
         if not doc_no and re.fullmatch(r"\d{3,}", text):
             doc_no = text
         elif not date and re.fullmatch(r"\d{2}/\d{2}/\d{4}", text):
@@ -439,7 +451,10 @@ def _describe_row(row: dict) -> Document:
             continue
         elif text not in title_parts:
             title_parts.append(text)
-    return Document(row=row["row"], doc_id=doc_no or date, title=" - ".join(title_parts), date=date)
+    exhibit_no = fields[exhibit_at] if exhibit_at >= 0 else ""
+    if doc_no and exhibit_no:
+        title_parts.insert(0, exhibit_no)
+    return Document(row=row["row"], doc_id=doc_no or exhibit_no or date, title=" - ".join(title_parts), date=date)
 
 
 def _fit_window_to_screen(page: Page) -> None:
@@ -454,6 +469,14 @@ def _fit_window_to_screen(page: Page) -> None:
         log.info("Demo window sized to %dx%d", bounds["width"], bounds["height"])
     except PlaywrightError as e:
         log.warning("Could not resize the demo window: %s", e)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _safe_filename(name: str) -> str:

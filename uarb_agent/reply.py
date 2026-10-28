@@ -9,11 +9,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional
 
-from .models import DOC_TYPES, SINGULAR, Document, FetchResult, MatterMetadata
-from .packager import archive_name
+from .index import SearchHit
+from .models import DOC_TYPES, SINGULAR, Document, FetchResult, MatterMetadata, reference_line
+from .packager import MANIFEST_NAME, archive_name, duplicates
 
 TYPES_LIST = "Exhibits, Key Documents, Other Documents, Transcripts, or Recordings"
 EXAMPLE_REQUEST = "Can you give me Other Documents files from M12205?"
+SEARCH_TIP = (
+    "You can also search the documents I've collected so far: start an email with "
+    "“search:” followed by your keywords."
+)
 
 
 def format_date(value: str) -> str:
@@ -85,9 +90,10 @@ def counts_sentence(meta: MatterMetadata) -> str:
     return sentence.strip()
 
 
-def _file_line(doc: Document) -> str:
+def _file_line(doc: Document, same_as: Optional[Document] = None) -> str:
     when = f" ({format_date(doc.date)})" if doc.date and doc.date != doc.doc_id else ""
-    return f"  - {archive_name(doc) if doc.path else doc.label}{when}"
+    note = f" – identical to {same_as.doc_id} on the site" if same_as else ""
+    return f"  - {archive_name(doc) if doc.path else doc.label}{when}{note}"
 
 
 def download_paragraphs(result: FetchResult, max_attachment_mb: float) -> List[str]:
@@ -119,7 +125,11 @@ def download_paragraphs(result: FetchResult, max_attachment_mb: float) -> List[s
     paragraphs.append(lead)
 
     if attached:
-        paragraphs.append("Files in the ZIP:\n" + "\n".join(_file_line(d) for d in attached))
+        repeats = duplicates(attached)
+        paragraphs.append(
+            f"Files in the ZIP ({MANIFEST_NAME} lists each one's details and checksum):\n"
+            + "\n".join(_file_line(d, repeats.get(d.row)) for d in attached)
+        )
     if result.oversized:
         k = len(result.oversized)
         paragraphs.append(
@@ -138,16 +148,17 @@ def download_paragraphs(result: FetchResult, max_attachment_mb: float) -> List[s
     return paragraphs
 
 
-def _letter(name: str, paragraphs: List[str], signature: str) -> str:
+def _letter(name: str, paragraphs: List[str], signature: str, reference: Optional[str] = None) -> str:
     body = "\n\n".join(p for p in paragraphs if p)
-    return f"Hi {name},\n\n{body}\n\nBest,\n{signature}\n"
+    footer = f"\n{reference}\n" if reference else ""
+    return f"Hi {name},\n\n{body}\n\nBest,\n{signature}\n{footer}"
 
 
 def compose_summary(name: str, result: FetchResult, signature: str, max_attachment_mb: float) -> str:
     meta = result.metadata
     paragraphs = download_paragraphs(result, max_attachment_mb)
     opening = f"{matter_summary(meta)} {counts_sentence(meta)} {paragraphs[0]}"
-    return _letter(name, [opening] + paragraphs[1:], signature)
+    return _letter(name, [opening] + paragraphs[1:], signature, reference_line(meta.matter, result.doc_type))
 
 
 def compose_missing_doc_type(name: str, meta: MatterMetadata, signature: str, limit: int) -> str:
@@ -159,6 +170,7 @@ def compose_missing_doc_type(name: str, meta: MatterMetadata, signature: str, li
             f"Reply with one of {TYPES_LIST} and I'll send up to {limit} of them as a ZIP.",
         ],
         signature,
+        reference_line(meta.matter, None),
     )
 
 
@@ -171,12 +183,14 @@ def compose_missing_matter(name: str, signature: str, doc_type: Optional[str]) -
             "Matter numbers start with M followed by five digits, for example M12205.",
             f"Please reply with the matter number and one of these document types: {TYPES_LIST}. "
             f"For example: “{EXAMPLE_REQUEST}”",
+            SEARCH_TIP,
         ],
         signature,
+        reference_line(None, doc_type),
     )
 
 
-def compose_not_found(name: str, matter: str, signature: str) -> str:
+def compose_not_found(name: str, matter: str, signature: str, doc_type: Optional[str] = None) -> str:
     return _letter(
         name,
         [
@@ -184,16 +198,71 @@ def compose_not_found(name: str, matter: str, signature: str) -> str:
             "Please check the number (the letter M followed by five digits) and send it again."
         ],
         signature,
+        reference_line(matter, doc_type),
     )
 
 
-def compose_failure(name: str, matter: Optional[str], signature: str) -> str:
+def compose_failure(name: str, matter: Optional[str], signature: str, doc_type: Optional[str] = None) -> str:
     what = f"the documents for {matter}" if matter else "your documents"
     return _letter(
         name,
         [
             f"Something went wrong while I was retrieving {what} from the UARB site, so I couldn't "
-            "finish your request. The site may be slow or down. Please try again in a little while."
+            "finish your request. The site may be slow or down. Please reply to this email in a little "
+            "while to try again."
         ],
         signature,
+        reference_line(matter, doc_type) if matter or doc_type else None,
+    )
+
+
+def compose_search_unavailable(name: str, signature: str) -> str:
+    return _letter(
+        name,
+        ["Search isn't turned on for this agent, but I can still fetch documents. "
+         f"For example: “{EXAMPLE_REQUEST}”"],
+        signature,
+    )
+
+
+def compose_search_results(
+    name: str, query: str, hits: List[SearchHit], documents: int, matters: int, signature: str
+) -> str:
+    scope = (
+        f"I searched the {documents} document{'s' if documents != 1 else ''} I've collected so far, "
+        f"from {matters} matter{'s' if matters != 1 else ''}, for “{query}”."
+    )
+    # A footer here too, so a reply to this email is never read for the matter numbers listed below.
+    reference = f"Request: search · “{query}”"
+    if documents == 0:
+        return _letter(
+            name,
+            [
+                f"I haven't collected any documents yet, so there's nothing to search for “{query}”. "
+                "Every request you send adds its documents to the search index. "
+                f"For example: “{EXAMPLE_REQUEST}”"
+            ],
+            signature,
+            reference,
+        )
+    if not hits:
+        return _letter(name, [f"{scope} Nothing matched. Try fewer or different keywords."], signature, reference)
+
+    lines = []
+    for i, hit in enumerate(hits, start=1):
+        when = f" ({format_date(hit.date)})" if hit.date and hit.date != hit.doc_id else ""
+        lines.append(f"{i}. {hit.matter} · {hit.doc_type} · {hit.doc_id} – {hit.title}{when}")
+        if hit.snippet:
+            lines.append(f"   “{hit.snippet}”")
+    best = hits[0]
+    return _letter(
+        name,
+        [
+            f"{scope} Here are the best {len(hits)} match{'es' if len(hits) != 1 else ''}:",
+            "\n".join(lines),
+            "To get the files, reply with a matter number and document type, for example "
+            f"“{best.doc_type} from {best.matter}”.",
+        ],
+        signature,
+        reference,
     )

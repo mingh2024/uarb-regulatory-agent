@@ -5,6 +5,14 @@ and a document type. It looks the matter up in the
 [Nova Scotia UARB Public Documents Database](https://uarb.novascotia.ca/fmi/webd/UARB15), downloads up
 to 10 documents of that type, zips them, and replies with the ZIP plus a summary of the matter.
 
+Beyond the brief, it also:
+
+- **remembers the thread.** Reply "now the exhibits please" and it keeps the matter number from before.
+- **builds a searchable library.** Every document it fetches goes into a full-text index. Email
+  "search: capital expenditure" to find passages across all the matters collected so far.
+- **ships a manifest.** Each ZIP includes `manifest.csv` with each file's details and SHA-256 checksum,
+  and flags PDFs the site files twice under different numbers.
+
 > **Request:** "Hi Agent, Can you give me Other Documents files from M12205? Thanks!"
 >
 > **Reply** (live output, October 27, 2026):
@@ -18,12 +26,16 @@ to 10 documents of that type, zips them, and replies with the ZIP plus a summary
 > and no Transcripts or Recordings. I downloaded 10 out of the 43 Other Documents and am attaching them
 > as a ZIP here.
 >
-> Files in the ZIP:
+> Files in the ZIP (manifest.csv lists each one's details and checksum):
 >   - 102674 - Board Order.pdf (July 8, 2026)
 >   - 102454 - HRWC (Board) Letter - Reply Submission.pdf (June 22, 2026)
->   - … 8 more
+>   - …
+>   - 102330 - HRWC (Board) Letter - Semi-Annual Update.pdf (June 10, 2026) – identical to 102329 on the site
+>   - …
 >
-> 📎 `M12205_Other_Documents.zip` (10 PDFs, 10 MB)
+> Request: M12205 · Other Documents
+>
+> 📎 `M12205_Other_Documents.zip` (10 PDFs + manifest.csv, 10 MB)
 
 (The assignment's example shows 5 Key Documents and 21 Other Documents. The matter has had more
 filings since then, and the agent reports what the site shows today.)
@@ -45,6 +57,12 @@ the reply, and saves the ZIP to `output/`:
 
 ```bash
 python -m uarb_agent ask "Hi Agent, Can you give me Other Documents files from M12205? Thanks!"
+```
+
+**Search what it has collected.** This is the same as emailing "search: …":
+
+```bash
+python -m uarb_agent search "capital expenditure approval"
 ```
 
 **Run it as an email agent.** This polls the inbox every 30 seconds and answers each unread request:
@@ -81,9 +99,12 @@ which handle the assignment's request format and common variants. See "Reading t
 
 ```
  inbox ──IMAP──▶ mailer.py ──▶ request_parser.py ──▶ scraper.py ──▶ packager.py ──▶ reply.py ──SMTP──▶ sender
-                 unread mail    Claude / rules:       Playwright      ZIP with        summary
-                 loop guards    matter + doc type     drives the      readable        email from
-                                                      UARB site       file names      templates
+                 unread mail    Claude / rules:       Playwright      ZIP, names,     summary
+                 loop guards    matter + doc type,    drives the      manifest.csv    email from
+                                thread memory         UARB site                       templates
+                                      │                   │
+                                      │ "search: …"       ▼
+                                      └────────────▶ index.py: SQLite + FTS5 over titles and PDF text
 ```
 
 | Module | Job |
@@ -91,7 +112,8 @@ which handle the assignment's request format and common variants. See "Reading t
 | `uarb_agent/mailer.py` | Reads unread mail over IMAP (without marking it read until answered), builds threaded replies, sends over SMTP. |
 | `uarb_agent/request_parser.py` | Extracts the matter number and document type from the email. |
 | `uarb_agent/scraper.py` | Drives the UARB site in headless Chromium: search, metadata, tab counts, downloads. |
-| `uarb_agent/packager.py` | Zips the files, renaming `102674.pdf` to `102674 - Board Order.pdf`. |
+| `uarb_agent/packager.py` | Zips the files, renaming `102674.pdf` to `102674 - Board Order.pdf`, and adds `manifest.csv`. |
+| `uarb_agent/index.py` | Searchable record of every matter and document fetched (SQLite FTS5). |
 | `uarb_agent/reply.py` | Writes the reply text. |
 | `uarb_agent/agent.py` | Ties one request together and decides which reply to send. |
 | `uarb_agent/__main__.py` | CLI and the inbox polling loop. |
@@ -113,9 +135,10 @@ Things I found while exploring the site that shaped the scraper:
 - **Metadata has no stable selectors.** Element ids encode layout object numbers that differ between
   layouts. The header is read by matching each value box to the nearest column label ("Type / Category",
   "Date Received", …).
-- **Tabs use different layouts.** Exhibits and documents rows are *doc no, title, extension, date*.
-  Transcripts and recordings rows are *date, title parts*. Rows are grouped by the portal-row part of
-  the element id (`…i3i0r1` = row 3), which is the same on every layout.
+- **Tabs use different layouts.** Key and Other Documents rows are *doc no, title, extension, date*.
+  Exhibits rows are *title, extension, date, exhibit number (A-1, H-12)*. Transcripts and recordings
+  rows are *date, title parts*. Rows are grouped by the portal-row part of the element id
+  (`…i3i0r1` = row 3), which is the same on every layout.
 - **"GO GET IT" doesn't download directly.** It opens a "Download Files" dialog with a button per file.
   Transcripts and recordings add an "Export Field to File" dialog first, with a pre-filled filename.
 - **System dialogs follow the browser's language.** On a Chinese-language Mac, a visible Chromium got
@@ -134,7 +157,7 @@ Things I found while exploring the site that shaped the scraper:
 
 One data quirk: some rows share the same PDF under two document numbers. For example, 102329 and
 102330 on M12205 are byte-identical, even when downloaded separately. The agent passes along what the
-site serves.
+site serves, but compares SHA-256 checksums and points the repeats out in the reply and the manifest.
 
 ### Reading the request
 
@@ -149,6 +172,43 @@ validated: the matter must match `M` + 5 digits and the type must be one of the 
   because of the model.
 - Email text is untrusted input. The model only fills two fields from a fixed set, and the system prompt
   tells it to treat the email as data. That leaves little room for prompt injection to do anything.
+
+### Remembering the thread
+
+Only the new part of an email is read for the request. Quoted history (Gmail's "On … wrote:", `>`
+lines, Outlook's "From: / Sent:" block) is split off first. The body outranks the subject, since a
+reply's subject is left over from the first email.
+
+If the matter or type is still missing, the agent looks at the quoted history. Every reply it sends
+ends with a footer like `Request: M12205 · Other Documents`. When a footer is quoted back, the agent
+trusts it and ignores the rest of its own earlier text. That text names every document type in its
+counts, plus a sample matter in its examples, which would otherwise be misread as a request. This makes
+these follow-ups work:
+
+| Agent said | User replies | Agent fetches |
+| --- | --- | --- |
+| Here are the Other Documents for M12205 | "Now the exhibits please" | M12205 Exhibits |
+| Which type do you want for M12383? | "Key Documents" | M12383 Key Documents |
+| I need a matter number for those Exhibits | "M12205" | M12205 Exhibits |
+| I couldn't find M99999 (Exhibits) | "Sorry, M12205" | M12205 Exhibits |
+
+### Searching collected documents
+
+After each fetch, `index.py` writes the matter's metadata and its documents to SQLite (`data/` by
+default). Titles, the matter title and the text of each PDF (via `pypdf`) go into an FTS5 index with
+Porter stemming, so "approval" also finds "approved". Search ranks with BM25, weighting document
+titles above matter titles above body text. A query first requires all its words, then falls back to
+any of them. Each word is quoted, so user input can't break FTS5 query syntax.
+
+> I searched the 14 documents I've collected so far, from 2 matters, for "capital expenditure approval".
+>
+> 1. M12205 · Other Documents · 102329 – Board (HRWC) Compliance Filing - Construction Costs (June 10, 2026)
+>    "…Director, Engineering & [Capital] Infrastructure Attachments: M12205 Attachment 1 – WSE [Capital] Budget Summary…"
+> 4. M12205 · Other Documents · 102674 – Board Order (July 8, 2026)
+>    "…In its Decision dated October 23, 2025, the Board [approved] the project with the…"
+
+The index only covers documents the agent has fetched, not the whole UARB database. Scanned PDFs have
+no text layer, so they're searchable by title only.
 
 ### Writing the reply
 
@@ -193,6 +253,7 @@ All settings come from environment variables or `.env`. See [.env.example](.env.
 | `MAX_ATTACHMENT_MB` | `18` | Total file size to attach. Gmail's 25 MB limit applies after base64 encoding. |
 | `HEADLESS` | `true` | Set `false` to watch the browser. |
 | `DEMO_MODE` | `false` | Visible screen-sized browser, slowed down for recording (same as `--demo`). |
+| `INDEX_PATH` | `data/uarb_index.sqlite3` | Search index file. Empty turns search off. |
 
 ## Tests
 
@@ -200,9 +261,17 @@ All settings come from environment variables or `.env`. See [.env.example](.env.
 python -m pytest
 ```
 
-The 38 unit tests cover request parsing (rules, Claude result handling and fallbacks), reply wording
-(including the assignment's example word for word), ZIP naming, the email headers, loop guards, and
-the agent's decisions. A fake scraper and a fake Claude client keep them offline and fast.
+The 62 unit tests cover:
+
+- request parsing: rules, Claude result handling and fallbacks, and thread memory with Gmail and
+  Outlook quoting
+- reply wording, including the assignment's example word for word
+- ZIP naming and the manifest
+- search: stemming, ranking, fallback, and query-syntax safety
+- the email headers and loop guards
+- the agent's decisions
+
+A fake scraper and a fake Claude client keep them offline and fast.
 
 These were also checked against the live site (October 27, 2026):
 
@@ -210,6 +279,8 @@ These were also checked against the live site (October 27, 2026):
 | --- | --- |
 | M12205 Other Documents | 10 of 43 attached, metadata matches the site, about 16 s |
 | M12383 Key Documents | "all 4 Key Documents" attached |
+| Follow-up "Now the exhibits please" under an M12383 reply | matter taken from the thread: all 6 M12383 Exhibits attached |
+| `search "capital expenditure approval"` after 3 requests | 8 ranked hits across 2 matters with highlighted PDF passages |
 | M10431 Transcripts | date-first layout, export dialog, comma filenames: all 10 attached, about 28 s |
 | M12205 Other Documents, `--demo` | visible 1470×860 window, grid scrolled past row 8, 10 of 43 attached, about 24 s |
 | M10431 Recordings | 326 MB and 34 MB MP3s, both reported as too large to email |
@@ -231,9 +302,12 @@ to a real IMAP/SMTP provider, since that needs the agent's own mailbox credentia
   The site doesn't report sizes before download, so the agent downloads each file, then sets aside the
   ones that don't fit. A recordings request can take several minutes this way. Uploading the ZIP to
   object storage and emailing a link would remove the cap.
-- **Building the searchable database.** The scraper already returns structured metadata (title, type,
-  category, dates, outcome, per-document titles and dates). Writing that and the files to a store with
-  full-text and vector indexes is the natural next step for the Regulatory Agent's research side.
+- **Growing the searchable database.** The index fills only as requests come in. Next steps for the
+  Regulatory Agent's research side:
+  - a background crawler that walks every matter
+  - OCR for scanned PDFs
+  - embeddings next to FTS5 for semantic search ("cases where a rate increase was denied")
+  - a shared database such as Postgres instead of a local SQLite file
 - **Site changes.** The scraper relies on visible text ("Go Directly to Matter", "GO GET IT", tab
   names) and layout geometry rather than generated ids. A redesign would still need updates, and a
   scheduled smoke test against a known matter would catch breakage early.

@@ -1,6 +1,7 @@
 playwright>=1.49
 anthropic>=0.125
 python-dotenv>=1.0
+pypdf>=5.0
 
 # tests
 pytest>=8.0

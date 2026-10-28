@@ -4,7 +4,14 @@ from types import SimpleNamespace
 import anthropic
 import pytest
 
-from uarb_agent.request_parser import RequestParser, clean_email_text, normalize_matter, parse_with_rules
+from uarb_agent.request_parser import (
+    RequestParser,
+    clean_email_text,
+    normalize_matter,
+    parse_with_rules,
+    search_query,
+    split_email,
+)
 
 
 @pytest.mark.parametrize(
@@ -31,6 +38,94 @@ def test_rules_take_first_mentioned_type():
 def test_clean_email_text_drops_quoted_history():
     body = "Recordings for M10431 please\n\nOn Mon, Oct 27, 2026 at 9:00 AM Agent wrote:\n> Exhibits for M12205"
     assert clean_email_text(body) == "Recordings for M10431 please"
+
+
+AGENT_REPLY_GMAIL = """Now the exhibits please
+
+On Mon, Oct 27, 2026 at 10:00 AM UARB Regulatory Agent <
+agent@example.com> wrote:
+> Hi Jane,
+>
+> M12205 is about ... I found 13 Exhibits, 6 Key Documents, 43 Other Documents.
+>
+> Best,
+> UARB Regulatory Agent
+>
+> Request: M12205 · Other Documents
+"""
+
+AGENT_REPLY_OUTLOOK = """M12383 please
+
+From: UARB Regulatory Agent <agent@example.com>
+Sent: Monday, October 27, 2026 10:00 AM
+Subject: RE: Request
+
+I'd be glad to fetch the Exhibits, but I couldn't find a matter number in your email.
+For example: “Can you give me Other Documents files from M12205?”
+
+Request: no matter number yet · Exhibits
+"""
+
+
+def test_split_email_separates_new_text_from_history():
+    new, quoted = split_email(AGENT_REPLY_GMAIL)
+    assert new == "Now the exhibits please"
+    assert quoted.splitlines()[-1] == "Request: M12205 · Other Documents"
+    new, quoted = split_email(AGENT_REPLY_OUTLOOK)
+    assert new == "M12383 please"
+    assert quoted.startswith("From: UARB Regulatory Agent")
+
+
+def test_follow_up_takes_missing_matter_from_the_thread():
+    request = RequestParser().parse("Re: Documents please", AGENT_REPLY_GMAIL)
+    assert (request.matter, request.doc_type, request.from_thread) == ("M12205", "Exhibits", ("matter",))
+
+
+def test_follow_up_takes_missing_type_but_not_the_agents_example_matter():
+    request = RequestParser().parse("RE: Request", AGENT_REPLY_OUTLOOK)
+    assert (request.matter, request.doc_type, request.from_thread) == ("M12383", "Exhibits", ("doc_type",))
+    unanswered = "thanks!\n\n> For example: Other Documents files from M12205\n> " \
+                 "Request: no matter number yet · no document type yet"
+    request = RequestParser().parse("Re: Request", unanswered)
+    assert (request.matter, request.doc_type) == (None, None)
+
+
+def test_quoted_history_without_agent_footer_is_read_like_a_request():
+    body = "Same as before but key docs\n\n> Can I get the exhibits for M12205?"
+    request = RequestParser().parse("", body)
+    assert (request.matter, request.doc_type, request.from_thread) == ("M12205", "Key Documents", ("matter",))
+
+
+@pytest.mark.parametrize(
+    "footer, answer, matter, doc_type",
+    [
+        ("Request: M12205 · Other Documents", "Now the exhibits please", "M12205", "Exhibits"),
+        ("Request: M12383 · no document type yet", "Key Documents", "M12383", "Key Documents"),
+        ("Request: no matter number yet · Exhibits", "M12205", "M12205", "Exhibits"),
+        ("Request: M99999 · Exhibits", "Sorry, M12205", "M12205", "Exhibits"),
+    ],
+)
+def test_readme_follow_up_table(footer, answer, matter, doc_type):
+    body = f"{answer}\n\nOn Mon, Oct 27, 2026 at 10:00 AM Agent wrote:\n> Hi,\n> ...\n> {footer}"
+    request = RequestParser().parse("Re: request", body)
+    assert (request.matter, request.doc_type) == (matter, doc_type)
+
+
+def test_body_wins_over_a_subject_left_over_from_the_thread():
+    request = RequestParser().parse("Re: key docs for M12383", "Now the exhibits please")
+    assert (request.matter, request.doc_type) == ("M12383", "Exhibits")
+
+
+def test_new_text_wins_over_the_thread():
+    request = RequestParser().parse("", "Transcripts for M10431\n\n> Request: M12205 · Exhibits")
+    assert (request.matter, request.doc_type, request.from_thread) == ("M10431", "Transcripts", ())
+
+
+def test_search_query():
+    assert search_query("", "search: capital expenditure\nthanks") == "capital expenditure"
+    assert search_query("Re: SEARCH: windsor street", "hi") == "windsor street"
+    assert search_query("", "Can you search for exhibits on M12205?") is None
+    assert search_query("", "search:   ") is None
 
 
 def test_normalize_matter():

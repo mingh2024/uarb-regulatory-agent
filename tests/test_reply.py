@@ -1,6 +1,10 @@
+from uarb_agent.index import SearchHit
 from uarb_agent.models import Document, FetchResult
 from uarb_agent.reply import (
+    compose_missing_doc_type,
     compose_missing_matter,
+    compose_not_found,
+    compose_search_results,
     compose_summary,
     counts_sentence,
     format_date,
@@ -87,3 +91,31 @@ def test_helpers():
 def test_missing_matter_reply_explains_format():
     body = compose_missing_matter("A", "S", "Exhibits")
     assert "fetch the Exhibits" in body and "M12205" in body
+    assert "search:" in body
+    assert body.rstrip().endswith("Request: no matter number yet · Exhibits")
+
+
+def test_every_request_reply_ends_with_its_reference(result, metadata):
+    assert compose_summary("A", result, "S", 18).rstrip().endswith("Request: M12205 · Other Documents")
+    assert compose_not_found("A", "M99999", "S", "Exhibits").rstrip().endswith("Request: M99999 · Exhibits")
+    assert compose_missing_doc_type("A", metadata, "S", 10).rstrip().endswith(
+        "Request: M12205 · no document type yet"
+    )
+
+
+def test_identical_files_are_pointed_out(result):
+    result.documents[4].sha256 = result.documents[3].sha256 = "same"
+    body = compose_summary("A", result, "S", 18)
+    assert "manifest.csv" in body
+    assert "  - 100004 - Letter 4.pdf (June 10, 2026) – identical to 100003 on the site" in body
+
+
+def test_search_results_reply():
+    hits = [SearchHit("M12205", "Other Documents", "102674", "Board Order", "07/08/2026", "approves the [capital] cost")]
+    body = compose_search_results("A", "capital", hits, 25, 3, "S")
+    assert "I searched the 25 documents I've collected so far, from 3 matters, for “capital”." in body
+    assert "1. M12205 · Other Documents · 102674 – Board Order (July 8, 2026)" in body
+    assert "   “approves the [capital] cost”" in body
+    assert "“Other Documents from M12205”" in body
+    assert "Nothing matched" in compose_search_results("A", "zzz", [], 25, 3, "S")
+    assert "haven't collected any documents yet" in compose_search_results("A", "zzz", [], 0, 0, "S")
