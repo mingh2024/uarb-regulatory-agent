@@ -9,16 +9,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional
 
-from .index import SearchHit
 from .models import DOC_TYPES, SINGULAR, Document, FetchResult, MatterMetadata, reference_line
 from .packager import MANIFEST_NAME, archive_name, duplicates
 
 TYPES_LIST = "Exhibits, Key Documents, Other Documents, Transcripts, or Recordings"
 EXAMPLE_REQUEST = "Can you give me Other Documents files from M12205?"
-SEARCH_TIP = (
-    "You can also search the documents I've collected so far: start an email with "
-    "“search:” followed by your keywords."
-)
 
 
 def format_date(value: str) -> str:
@@ -183,7 +178,6 @@ def compose_missing_matter(name: str, signature: str, doc_type: Optional[str]) -
             "Matter numbers start with M followed by five digits, for example M12205.",
             f"Please reply with the matter number and one of these document types: {TYPES_LIST}. "
             f"For example: “{EXAMPLE_REQUEST}”",
-            SEARCH_TIP,
         ],
         signature,
         reference_line(None, doc_type),
@@ -215,54 +209,3 @@ def compose_failure(name: str, matter: Optional[str], signature: str, doc_type: 
         reference_line(matter, doc_type) if matter or doc_type else None,
     )
 
-
-def compose_search_unavailable(name: str, signature: str) -> str:
-    return _letter(
-        name,
-        ["Search isn't turned on for this agent, but I can still fetch documents. "
-         f"For example: “{EXAMPLE_REQUEST}”"],
-        signature,
-    )
-
-
-def compose_search_results(
-    name: str, query: str, hits: List[SearchHit], documents: int, matters: int, signature: str
-) -> str:
-    scope = (
-        f"I searched the {documents} document{'s' if documents != 1 else ''} I've collected so far, "
-        f"from {matters} matter{'s' if matters != 1 else ''}, for “{query}”."
-    )
-    # A footer here too, so a reply to this email is never read for the matter numbers listed below.
-    reference = f"Request: search · “{query}”"
-    if documents == 0:
-        return _letter(
-            name,
-            [
-                f"I haven't collected any documents yet, so there's nothing to search for “{query}”. "
-                "Every request you send adds its documents to the search index. "
-                f"For example: “{EXAMPLE_REQUEST}”"
-            ],
-            signature,
-            reference,
-        )
-    if not hits:
-        return _letter(name, [f"{scope} Nothing matched. Try fewer or different keywords."], signature, reference)
-
-    lines = []
-    for i, hit in enumerate(hits, start=1):
-        when = f" ({format_date(hit.date)})" if hit.date and hit.date != hit.doc_id else ""
-        lines.append(f"{i}. {hit.matter} · {hit.doc_type} · {hit.doc_id} – {hit.title}{when}")
-        if hit.snippet:
-            lines.append(f"   “{hit.snippet}”")
-    best = hits[0]
-    return _letter(
-        name,
-        [
-            f"{scope} Here are the best {len(hits)} match{'es' if len(hits) != 1 else ''}:",
-            "\n".join(lines),
-            "To get the files, reply with a matter number and document type, for example "
-            f"“{best.doc_type} from {best.matter}”.",
-        ],
-        signature,
-        reference,
-    )

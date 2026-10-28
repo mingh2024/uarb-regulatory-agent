@@ -54,6 +54,8 @@ def test_should_ignore_loops_and_strangers():
     assert should_ignore(incoming(From="agent@example.com"), config)
     assert should_ignore(incoming(Auto_Submitted="auto-replied"), config)
     assert should_ignore(incoming(From="MAILER-DAEMON@example.com"), config)
+    assert should_ignore(incoming(From="Google <googlecommunityteam-noreply@google.com>"), config)
+    assert should_ignore(incoming(From="no-reply@accounts.google.com"), config)
     assert should_ignore(incoming(Precedence="bulk"), config)
     locked = Config(agent_email="agent@example.com", allowed_senders=frozenset({"boss@example.com"}))
     assert should_ignore(incoming(), locked) == "sender not in ALLOWED_SENDERS"

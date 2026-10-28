@@ -180,7 +180,9 @@ class UARBScraper:
                 log.warning("Attempt %d to fetch %s failed: %s", attempt, matter, e)
         raise ScrapeError(f"Could not read {matter} from the UARB site: {last_error}") from last_error
 
-    def _fetch_once(self, matter, doc_type, dest_dir, limit, max_total_bytes) -> FetchResult:
+    def _fetch_once(
+        self, matter: str, doc_type: Optional[str], dest_dir: Path, limit: int, max_total_bytes: Optional[int]
+    ) -> FetchResult:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=self.headless, slow_mo=DEMO_SLOW_MO_MS if self.demo else 0)
             try:
@@ -305,7 +307,9 @@ class UARBScraper:
 
     # -- documents --------------------------------------------------------
 
-    def _download_documents(self, page, result: FetchResult, dest_dir, limit, max_total_bytes) -> None:
+    def _download_documents(
+        self, page: Page, result: FetchResult, dest_dir: Path, limit: int, max_total_bytes: Optional[int]
+    ) -> None:
         doc_type = result.doc_type
         log.info("Opening the %s tab", doc_type)
         page.locator("button", has_text=re.compile(r"^\s*%s\s*-" % re.escape(doc_type))).first.click()
@@ -463,7 +467,8 @@ def _fit_window_to_screen(page: Page) -> None:
         cdp = page.context.new_cdp_session(page)
         window_id = cdp.send("Browser.getWindowForTarget")["windowId"]
         bounds = page.evaluate(
-            "() => ({left: screen.availLeft, top: screen.availTop, width: screen.availWidth, height: screen.availHeight})"
+            "() => ({left: screen.availLeft, top: screen.availTop,"
+            " width: screen.availWidth, height: screen.availHeight})"
         )
         cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": bounds})
         log.info("Demo window sized to %dx%d", bounds["width"], bounds["height"])

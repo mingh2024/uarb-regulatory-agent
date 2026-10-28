@@ -63,7 +63,6 @@ SCHEMA = {
 
 
 REFERENCE_RE = re.compile(r"^Request:\s*(.+?)\s*·\s*(.+?)\s*$")
-SEARCH_RE = re.compile(r"^\s*search\s*:\s*(.+)$", re.IGNORECASE)
 
 
 def _starts_quoted_history(lines: List[str], i: int) -> bool:
@@ -93,21 +92,6 @@ def split_email(body: str) -> Tuple[str, str]:
         else:
             new.append(line)
     return "\n".join(new).strip(), "\n".join(quoted).strip()
-
-
-def clean_email_text(body: str) -> str:
-    """Only what the sender wrote in this message, without the quoted history."""
-    return split_email(body)[0]
-
-
-def search_query(subject: str, body: str) -> Optional[str]:
-    """The query of a "search: ..." email (first line of the message, or the subject), else None."""
-    first_line = next((l for l in clean_email_text(body).splitlines() if l.strip()), "")
-    for text in (first_line, re.sub(r"^\s*((re|fwd?)\s*:\s*)+", "", subject, flags=re.IGNORECASE)):
-        match = SEARCH_RE.match(text)
-        if match and match.group(1).strip():
-            return match.group(1).strip()
-    return None
 
 
 def from_thread(quoted: str) -> DocumentRequest:
@@ -147,7 +131,9 @@ def parse_with_rules(text: str) -> DocumentRequest:
 
 
 class RequestParser:
-    def __init__(self, use_llm: bool = False, model: str = "claude-opus-5-5", client: Optional[anthropic.Anthropic] = None):
+    def __init__(
+        self, use_llm: bool = False, model: str = "claude-opus-5-5", client: Optional[anthropic.Anthropic] = None
+    ):
         self.use_llm = use_llm
         self.model = model
         self._client = client

@@ -12,7 +12,9 @@ from .models import Document
 
 MAX_NAME_LENGTH = 120
 MANIFEST_NAME = "manifest.csv"
-MANIFEST_COLUMNS = ["file", "matter", "document_type", "doc_id", "title", "date", "size_bytes", "sha256", "identical_to"]
+MANIFEST_COLUMNS = [
+    "file", "matter", "document_type", "doc_id", "title", "date", "size_bytes", "sha256", "identical_to",
+]
 
 
 def archive_name(doc: Document) -> str:

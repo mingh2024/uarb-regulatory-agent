@@ -32,7 +32,7 @@ class DocumentRequest:
 
     matter: Optional[str]
     doc_type: Optional[str]
-    parsed_by: str = "rules"  # "llm" or "rules"
+    parsed_by: str = "rules"  # "llm", "rules", or "thread" (read from quoted earlier emails)
     from_thread: Tuple[str, ...] = ()  # fields recovered from earlier emails in the thread
 
 

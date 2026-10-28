@@ -1,10 +1,8 @@
-from uarb_agent.index import SearchHit
 from uarb_agent.models import Document, FetchResult
 from uarb_agent.reply import (
     compose_missing_doc_type,
     compose_missing_matter,
     compose_not_found,
-    compose_search_results,
     compose_summary,
     counts_sentence,
     format_date,
@@ -65,9 +63,13 @@ def test_partial_attachment_with_failures(metadata, make_docs):
 
 def test_counts_sentence_variants(metadata):
     metadata.counts = {"Exhibits": 1, "Key Documents": 0, "Other Documents": 0, "Transcripts": 0, "Recordings": 0}
-    assert counts_sentence(metadata) == "I found 1 Exhibit and no Key Documents, Other Documents, Transcripts, or Recordings."
+    assert counts_sentence(metadata) == (
+        "I found 1 Exhibit and no Key Documents, Other Documents, Transcripts, or Recordings."
+    )
     metadata.counts = {t: 0 for t in metadata.counts}
-    assert counts_sentence(metadata) == "I found no Exhibits, Key Documents, Other Documents, Transcripts, or Recordings."
+    assert counts_sentence(metadata) == (
+        "I found no Exhibits, Key Documents, Other Documents, Transcripts, or Recordings."
+    )
 
 
 def test_matter_summary_with_generic_category(metadata):
@@ -91,7 +93,6 @@ def test_helpers():
 def test_missing_matter_reply_explains_format():
     body = compose_missing_matter("A", "S", "Exhibits")
     assert "fetch the Exhibits" in body and "M12205" in body
-    assert "search:" in body
     assert body.rstrip().endswith("Request: no matter number yet · Exhibits")
 
 
@@ -109,13 +110,3 @@ def test_identical_files_are_pointed_out(result):
     assert "manifest.csv" in body
     assert "  - 100004 - Letter 4.pdf (June 10, 2026) – identical to 100003 on the site" in body
 
-
-def test_search_results_reply():
-    hits = [SearchHit("M12205", "Other Documents", "102674", "Board Order", "07/08/2026", "approves the [capital] cost")]
-    body = compose_search_results("A", "capital", hits, 25, 3, "S")
-    assert "I searched the 25 documents I've collected so far, from 3 matters, for “capital”." in body
-    assert "1. M12205 · Other Documents · 102674 – Board Order (July 8, 2026)" in body
-    assert "   “approves the [capital] cost”" in body
-    assert "“Other Documents from M12205”" in body
-    assert "Nothing matched" in compose_search_results("A", "zzz", [], 25, 3, "S")
-    assert "haven't collected any documents yet" in compose_search_results("A", "zzz", [], 0, 0, "S")

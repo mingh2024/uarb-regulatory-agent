@@ -18,6 +18,9 @@ from .config import Config
 
 log = logging.getLogger(__name__)
 
+TIMEOUT_SECONDS = 60
+SYSTEM_SENDER_RE = re.compile(r"^(mailer-daemon|postmaster)@|no-?reply[^@]*@|do-?not-?reply[^@]*@")
+
 
 @dataclass
 class IncomingEmail:
@@ -71,7 +74,7 @@ def should_ignore(mail: IncomingEmail, config: Config) -> Optional[str]:
         return "automatic message"
     if headers.get("Precedence", "").lower() in ("bulk", "junk", "list"):
         return "bulk or list mail"
-    if re.match(r"(mailer-daemon|postmaster|no-?reply)@", sender):
+    if SYSTEM_SENDER_RE.search(sender):
         return "system address"
     return None
 
@@ -109,7 +112,7 @@ class Mailbox:
         self.config = config
 
     def _imap(self) -> imaplib.IMAP4_SSL:
-        imap = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
+        imap = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port, timeout=TIMEOUT_SECONDS)
         imap.login(self.config.imap_user, self.config.imap_password)
         imap.select(self.config.imap_folder)
         return imap
@@ -142,9 +145,11 @@ class Mailbox:
     def send(self, message: EmailMessage) -> None:
         context = ssl.create_default_context()
         if self.config.smtp_port == 465:
-            server = smtplib.SMTP_SSL(self.config.smtp_host, self.config.smtp_port, context=context)
+            server = smtplib.SMTP_SSL(
+                self.config.smtp_host, self.config.smtp_port, context=context, timeout=TIMEOUT_SECONDS
+            )
         else:
-            server = smtplib.SMTP(self.config.smtp_host, self.config.smtp_port)
+            server = smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=TIMEOUT_SECONDS)
             server.starttls(context=context)
         with server:
             if self.config.smtp_user:

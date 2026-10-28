@@ -3,7 +3,6 @@
     python -m uarb_agent run            # watch the inbox and answer requests
     python -m uarb_agent run --once     # answer what is waiting, then exit
     python -m uarb_agent ask "Hi Agent, can you give me Other Documents files from M12205?"
-    python -m uarb_agent search "capital expenditure"   # across everything fetched so far
 
 Add --demo to either command to watch the browser work (for recording a demo).
 """
@@ -96,7 +95,9 @@ def cmd_ask(args, config: Config) -> int:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="uarb_agent", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        prog="uarb_agent", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -111,10 +112,6 @@ def main(argv=None) -> int:
     ask.add_argument("--name", default="User", help="name to greet in the reply")
     ask.add_argument("--demo", action="store_true", help=demo_help)
 
-    search = sub.add_parser("search", help="search the documents collected so far")
-    search.add_argument("query", help="keywords, e.g. 'capital expenditure water'")
-    search.add_argument("--name", default="User", help="name to greet in the reply")
-
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -122,11 +119,9 @@ def main(argv=None) -> int:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     config = Config.from_env()
-    config.demo = config.demo or getattr(args, "demo", False)
+    config.demo = config.demo or args.demo
     if args.command == "run":
         return cmd_run(args, config)
-    if args.command == "search":
-        args.text, args.subject = f"search: {args.query}", ""
     return cmd_ask(args, config)
 
 

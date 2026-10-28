@@ -6,10 +6,8 @@ import pytest
 
 from uarb_agent.request_parser import (
     RequestParser,
-    clean_email_text,
     normalize_matter,
     parse_with_rules,
-    search_query,
     split_email,
 )
 
@@ -35,9 +33,11 @@ def test_rules_take_first_mentioned_type():
     assert parse_with_rules("Transcripts (not the exhibits) for M12205").doc_type == "Transcripts"
 
 
-def test_clean_email_text_drops_quoted_history():
+def test_split_email_drops_quoted_history():
     body = "Recordings for M10431 please\n\nOn Mon, Oct 27, 2026 at 9:00 AM Agent wrote:\n> Exhibits for M12205"
-    assert clean_email_text(body) == "Recordings for M10431 please"
+    new, quoted = split_email(body)
+    assert new == "Recordings for M10431 please"
+    assert quoted.endswith("Exhibits for M12205")
 
 
 AGENT_REPLY_GMAIL = """Now the exhibits please
@@ -119,13 +119,6 @@ def test_body_wins_over_a_subject_left_over_from_the_thread():
 def test_new_text_wins_over_the_thread():
     request = RequestParser().parse("", "Transcripts for M10431\n\n> Request: M12205 · Exhibits")
     assert (request.matter, request.doc_type, request.from_thread) == ("M10431", "Transcripts", ())
-
-
-def test_search_query():
-    assert search_query("", "search: capital expenditure\nthanks") == "capital expenditure"
-    assert search_query("Re: SEARCH: windsor street", "hi") == "windsor street"
-    assert search_query("", "Can you search for exhibits on M12205?") is None
-    assert search_query("", "search:   ") is None
 
 
 def test_normalize_matter():

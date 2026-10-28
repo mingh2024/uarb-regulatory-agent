@@ -2,7 +2,6 @@ import zipfile
 
 from uarb_agent.agent import RegulatoryAgent
 from uarb_agent.config import Config
-from uarb_agent.index import DocumentIndex
 from uarb_agent.models import FetchResult
 from uarb_agent.request_parser import RequestParser
 from uarb_agent.scraper import MatterNotFound, ScrapeError, _describe_row
@@ -21,10 +20,8 @@ class FakeScraper:
         return self.result
 
 
-def make_agent(scraper, index=None):
-    return RegulatoryAgent(
-        Config(max_documents=10, index_path=None), scraper=scraper, parser=RequestParser(use_llm=False), index=index
-    )
+def make_agent(scraper):
+    return RegulatoryAgent(Config(max_documents=10), scraper=scraper, parser=RequestParser(use_llm=False))
 
 
 def test_happy_path_returns_zip(tmp_path, result):
@@ -46,22 +43,6 @@ def test_follow_up_reply_keeps_the_matter_from_the_thread(tmp_path, result):
     follow_up = f"Thanks! Now the exhibits please.\n\nOn Mon, Oct 27, 2026 at 10:00 AM Agent wrote:\n{quoted}"
     agent.handle("Re: Documents please", follow_up, "Jane", tmp_path / "2")
     assert scraper.calls[1][:2] == ("M12205", "Exhibits")
-
-
-def test_fetches_are_indexed_and_searchable_by_email(tmp_path, result):
-    index = DocumentIndex(tmp_path / "index.sqlite3")
-    agent = make_agent(FakeScraper(result), index=index)
-    agent.handle("", "Other Documents for M12205", "Jane", tmp_path / "work")
-    assert index.stats() == (10, 1)
-    reply = agent.handle("", "search: letter 3", "Jane", tmp_path / "search")
-    assert "I searched the 10 documents I've collected so far, from 1 matter" in reply.body
-    assert "1. M12205 · Other Documents · 100003 – Letter 3" in reply.body
-    assert reply.attachment is None
-
-
-def test_search_without_an_index(tmp_path):
-    reply = make_agent(FakeScraper()).handle("Search: rates", "", "", tmp_path)
-    assert "Search isn't turned on" in reply.body
 
 
 def test_missing_matter_does_not_scrape(tmp_path):
@@ -90,12 +71,9 @@ def test_not_found_and_site_errors(tmp_path):
 
 def test_demo_mode_shows_the_browser(monkeypatch):
     monkeypatch.setenv("DEMO_MODE", "true")
-    monkeypatch.setenv("INDEX_PATH", "")
-    config = Config.from_env(env_file=None)
-    assert config.index_path is None
-    scraper = RegulatoryAgent(config).scraper
+    scraper = RegulatoryAgent(Config.from_env(env_file=None)).scraper
     assert (scraper.demo, scraper.headless) == (True, False)
-    assert RegulatoryAgent(Config(index_path=None)).scraper.headless is True
+    assert RegulatoryAgent(Config()).scraper.headless is True
 
 
 def test_describe_row_handles_both_layouts():

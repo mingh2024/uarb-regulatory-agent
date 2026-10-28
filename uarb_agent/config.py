@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import FrozenSet, Optional
+from typing import FrozenSet, List, Optional
 
 from dotenv import load_dotenv
 
@@ -48,8 +48,6 @@ class Config:
     headless: bool = True
     demo: bool = False  # visible, screen-sized, slowed-down browser for recordings
     output_dir: Path = Path("output")
-    # Searchable record of every matter and document fetched. None turns search off.
-    index_path: Optional[Path] = Path("data/uarb_index.sqlite3")
 
     @classmethod
     def from_env(cls, env_file: Optional[str] = ".env") -> "Config":
@@ -59,7 +57,6 @@ class Config:
         imap_password = os.getenv("IMAP_PASSWORD", "")
         has_claude_credentials = bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))
         allowed = os.getenv("ALLOWED_SENDERS", "")
-        index_path = os.getenv("INDEX_PATH", "data/uarb_index.sqlite3").strip()
         return cls(
             imap_host=os.getenv("IMAP_HOST", ""),
             imap_port=_int("IMAP_PORT", 993),
@@ -81,10 +78,9 @@ class Config:
             headless=_bool("HEADLESS", True),
             demo=_bool("DEMO_MODE", False),
             output_dir=Path(os.getenv("OUTPUT_DIR", "output")),
-            index_path=Path(index_path) if index_path else None,
         )
 
-    def missing_email_settings(self) -> list:
+    def missing_email_settings(self) -> List[str]:
         required = {
             "IMAP_HOST": self.imap_host,
             "IMAP_USER": self.imap_user,
